@@ -1,0 +1,62 @@
+MICRODOWELL(8)
+==============
+
+NAME
+----
+
+microdowell - Driver for Microdowell Enterprise UPS series
+
+SYNOPSIS
+--------
+
+*microdowell* -h
+
+*microdowell* -a 'UPS_NAME' ['OPTIONS']
+
+NOTE: This man page only documents the hardware-specific features of the
+Microdowell driver.  For information about the core driver, see
+linkman:nutupsdrv[8].
+
+SUPPORTED HARDWARE
+------------------
+
+This driver was developed for the Enterprise Nxx and Bxx models.
+Other Microdowell models may work, too.
+
+EXTRA ARGUMENTS
+---------------
+
+This driver supports the following settings in linkman:ups.conf[5]:
+
+*ups.delay.shutdown*='num'::
+Set the shutdown delay in seconds (default: 120). The stored value is
+limited to the range 0 to 32767. When sending a shutdown command, the
+driver uses a minimum delay of 6 seconds.
+
+*ups.delay.start*='num'::
+Set the restart delay in seconds (default: 10). The stored value is
+limited to the range 0 to 999999.
+
+Both values are also available as writable runtime variables through
+linkman:upsrw[8]. Runtime changes apply to the running driver instance.
+Fresh driver initialization loads the configured values. If a running
+driver instance accepts a *-k* request, its runtime values remain in
+effect; otherwise the new *-k* process loads the configured values.
+
+AUTHOR
+------
+
+Elio Corbolante <eliocor@microdowell.com>
+
+SEE ALSO
+--------
+
+The core driver:
+~~~~~~~~~~~~~~~~
+
+linkman:nutupsdrv[8]
+
+Internet resources:
+~~~~~~~~~~~~~~~~~~~
+
+The NUT (Network UPS Tools) home page: https://www.networkupstools.org/

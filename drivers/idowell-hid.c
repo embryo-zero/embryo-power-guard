@@ -1,0 +1,365 @@
+/* idowell-hid.c - subdriver to monitor iDowell USB/HID devices with NUT
+ *
+ *  Copyright (C)
+ *  2003 - 2009	Arnaud Quette <ArnaudQuette@Eaton.com>
+ *  2005 - 2006	Peter Selinger <selinger@users.sourceforge.net>
+ *  2008 - 2009	Arjen de Korte <adkorte-guest@alioth.debian.org>
+ *
+ *  Note: this subdriver was initially generated as a "stub" by the
+ *  gen-usbhid-subdriver script. It must be customized.
+ *
+ *  This program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program; if not, write to the Free Software
+ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ */
+
+#include "config.h" /* must be first */
+
+#include "usbhid-ups.h"
+#include "idowell-hid.h"
+#include "main.h"	/* for getval() */
+#include "usb-common.h"
+#include "hidparser.h" /* for FindObject_with_ID_Node() */
+
+#define IDOWELL_HID_VERSION	"iDowell HID 0.24"
+/* FIXME: experimental flag to be put in upsdrv_info */
+/* v0.24 GoldenMate: restore the Power Device page on the Good and
+ *       ShutdownImminent PresentStatus bits, see idowell_fix_status_usage() */
+/* v0.21 GoldenMate LiFePO4 packs reuse the shared Phoenixtec VID (0x06da):
+ *       claim only those (by -BMS-/Smart-Battery firmware strings) and defer
+ *       everything else on that VID to liebert-hid / mge-hid */
+/* v0.20 Goldenmate also uses the same vendorID and productID so added additional HID2NUT lookup values */
+
+/* iDowell, Goldenmate */
+#define IDOWELL_VENDORID	0x075d
+
+/* Phoenixtec Power Co., Ltd; this VID is shared with liebert-hid (the default
+ * sink for 0x06da) and mge-hid (AEG PROTECT NAS). GoldenMate 1000VA/800W
+ * LiFePO4 packs reuse 0x06da:0xffff with the same iDowell-style -BMS- firmware
+ * and HID descriptor as 0x075d:0x0300, so the table match is gated by device
+ * strings in idowell_claim() to avoid hijacking the other 0x06da devices. */
+#define PHOENIXTEC_VENDORID	0x06da
+
+/* USB IDs device table */
+static usb_device_id_t idowell_usb_device_table[] = {
+	/* iDowell, Goldenmate */
+	{ USB_DEVICE(IDOWELL_VENDORID, 0x0300), NULL },
+	/* GoldenMate 1000VA/800W LiFePO4; claim gated by strings, see idowell_claim() */
+	{ USB_DEVICE(PHOENIXTEC_VENDORID, 0xffff), NULL },
+
+	/* Terminating entry */
+	{ 0, 0, NULL }
+};
+
+/* --------------------------------------------------------------- */
+/*      Vendor-specific usage table */
+/* --------------------------------------------------------------- */
+
+/* IDOWELL usage table */
+static usage_lkp_t idowell_usage_lkp[] = {
+	{  NULL, 0 }
+};
+
+static usage_tables_t idowell_utab[] = {
+	idowell_usage_lkp,
+	hid_usage_lkp,
+	NULL,
+};
+
+/* --------------------------------------------------------------- */
+/* HID2NUT lookup table                                            */
+/* --------------------------------------------------------------- */
+
+static hid_info_t idowell_hid2nut[] = {
+#if WITH_UNMAPPED_DATA_POINTS || (defined DEBUG)
+	{ "unmapped.ups.flow.[4].flowid", 0, 0, "UPS.Flow.[4].FlowID", NULL, "%.0f", 0, NULL },
+	{ "unmapped.ups.powerconverter.output.outputid", 0, 0, "UPS.PowerConverter.Output.OutputID", NULL, "%.0f", 0, NULL },
+	{ "unmapped.ups.powerconverter.powerconverterid", 0, 0, "UPS.PowerConverter.PowerConverterID", NULL, "%.0f", 0, NULL },
+	{ "unmapped.ups.powersummary.batterypresent", 0, 0, "UPS.PowerSummary.BatteryPresent", NULL, "%.0f", 0, NULL },
+	{ "unmapped.ups.powersummary.capacitygranularity1", 0, 0, "UPS.PowerSummary.CapacityGranularity1", NULL, "%.0f", 0, NULL },
+	{ "unmapped.ups.powersummary.capacitymode", 0, 0, "UPS.PowerSummary.CapacityMode", NULL, "%.0f", 0, NULL },
+	{ "unmapped.ups.powersummary.flowid", 0, 0, "UPS.PowerSummary.FlowID", NULL, "%.0f", 0, NULL },
+	{ "unmapped.ups.powersummary.powersummaryid", 0, 0, "UPS.PowerSummary.PowerSummaryID", NULL, "%.0f", 0, NULL },
+	{ "unmapped.ups.powersummary.presentstatus.atratetimetoempty", 0, 0, "UPS.PowerSummary.PresentStatus.AtRateTimeToEmpty", NULL, "%.0f", 0, NULL },
+	{ "unmapped.ups.powersummary.presentstatus.averagetimetoempty", 0, 0, "UPS.PowerSummary.PresentStatus.AverageTimeToEmpty", NULL, "%.0f", 0, NULL },
+	{ "unmapped.ups.powersummary.presentstatus.undefined", 0, 0, "UPS.PowerSummary.PresentStatus.Undefined", NULL, "%.0f", 0, NULL },
+	{ "unmapped.ups.powersummary.rechargeable", 0, 0, "UPS.PowerSummary.Rechargeable", NULL, "%.0f", HU_FLAG_STATIC, NULL }, /* Read only */
+#endif	/* if WITH_UNMAPPED_DATA_POINTS || DEBUG */
+
+	{ "BOOL", 0, 0, "UPS.PowerSummary.PresentStatus.ACPresent", NULL, NULL, HU_FLAG_QUICK_POLL, online_info },
+	{ "BOOL", 0, 0, "UPS.PowerSummary.PresentStatus.BatteryPresent", NULL, NULL, 0, nobattery_info },
+	{ "BOOL", 0, 0, "UPS.PowerSummary.PresentStatus.BelowRemainingCapacityLimit", NULL, NULL, HU_FLAG_QUICK_POLL, lowbatt_info },
+	{ "BOOL", 0, 0, "UPS.PowerSummary.PresentStatus.Charging", NULL, NULL, HU_FLAG_QUICK_POLL, charging_info },
+	{ "BOOL", 0, 0, "UPS.PowerSummary.PresentStatus.CommunicationLost", NULL, NULL, 0, commfault_info },
+	{ "BOOL", 0, 0, "UPS.PowerSummary.PresentStatus.Discharging", NULL, NULL, HU_FLAG_QUICK_POLL, discharging_info },
+	{ "BOOL", 0, 0, "UPS.PowerSummary.PresentStatus.Good", NULL, NULL, 0, off_info },
+	{ "BOOL", 0, 0, "UPS.PowerSummary.PresentStatus.InternalFailure", NULL, NULL, 0, commfault_info },
+	{ "BOOL", 0, 0, "UPS.PowerSummary.PresentStatus.NeedReplacement", NULL, NULL, 0, replacebatt_info },
+	{ "BOOL", 0, 0, "UPS.PowerSummary.PresentStatus.Overload", NULL, NULL, 0, overload_info },
+	{ "BOOL", 0, 0, "UPS.PowerSummary.PresentStatus.ShutdownImminent", NULL, NULL, 0, shutdownimm_info },
+
+	/* device page */
+	{ "device.mfr", 0, 0, "UPS.PowerSummary.iManufacturer", NULL, "%s", HU_FLAG_STATIC, stringid_conversion }, /* Read only */
+	{ "device.model", 0, 0, "UPS.PowerSummary.iProduct", NULL, "%s", HU_FLAG_STATIC, stringid_conversion }, /* Read only */
+	{ "device.serial", 0, 0, "UPS.PowerSummary.iSerialNumber", NULL, "%s", HU_FLAG_STATIC, stringid_conversion }, /* Read only */
+
+	/* battery page */
+	{ "battery.capacity.design", 0, 0, "UPS.PowerSummary.DesignCapacity", NULL, "%.0f", HU_FLAG_STATIC, NULL }, /* Read only */
+	{ "battery.charge", 0, 0, "UPS.PowerSummary.RemainingCapacity", NULL, "%.0f", 0, NULL },
+	{ "battery.charge.low", 0, 0, "UPS.PowerSummary.RemainingCapacityLimit", NULL, "%.0f", HU_FLAG_STATIC , NULL }, /* Read only */
+	{ "battery.charge.low", 0, 0, "UPS.PowerSummary.WarningCapacityLimit", NULL, "%.0f", HU_FLAG_STATIC, NULL }, /* Read only */
+	{ "battery.capacity.full", 0, 0, "UPS.PowerSummary.FullChargeCapacity", NULL, "%.0f", 0, NULL },
+	{ "battery.runtime", 0, 0, "UPS.PowerSummary.RunTimeToEmpty", NULL, "%.0f", 0, NULL },
+	{ "battery.type", 0, 0, "UPS.PowerSummary.iDeviceChemistry", NULL, "%s", HU_FLAG_STATIC, stringid_conversion }, /* Read only */
+
+	/* UPS page */
+	{ "ups.delay.start", ST_FLAG_RW | ST_FLAG_STRING, 10, "UPS.PowerSummary.DelayBeforeStartup", NULL, DEFAULT_ONDELAY, HU_FLAG_ABSENT, NULL},
+	{ "ups.delay.shutdown", ST_FLAG_RW | ST_FLAG_STRING, 10, "UPS.PowerSummary.DelayBeforeShutdown", NULL, DEFAULT_OFFDELAY, HU_FLAG_ABSENT, NULL},
+	{ "ups.timer.start", 0, 0, "UPS.PowerSummary.DelayBeforeStartup", NULL, "%.0f", HU_FLAG_QUICK_POLL, NULL},
+	{ "ups.timer.shutdown", 0, 0, "UPS.PowerSummary.DelayBeforeShutdown", NULL, "%.0f", HU_FLAG_QUICK_POLL, NULL},
+	{ "ups.load", 0, 0, "UPS.PowerSummary.PercentLoad", NULL, "%.0f", 0, NULL },
+	{ "ups.power.nominal", 0, 0, "UPS.Flow.[4].ConfigApparentPower", NULL, "%.0f", HU_FLAG_STATIC, NULL },
+
+	/* input page */
+	{ "input.transfer.high", 0, 0, "UPS.PowerConverter.Output.HighVoltageTransfer", NULL, "%.0f", HU_FLAG_STATIC, NULL },
+	{ "input.transfer.low", 0, 0, "UPS.PowerConverter.Output.LowVoltageTransfer", NULL, "%.0f", HU_FLAG_STATIC, NULL },
+
+	/* output page */
+	{ "output.voltage", 0, 0, "UPS.PowerConverter.Output.Voltage", NULL, "%.1f", 0, NULL },
+	{ "battery.voltage", 0, 0, "UPS.PowerSummary.Voltage", NULL, "%.1f", 0, NULL },
+	{ "output.voltage.nominal", 0, 0, "UPS.Flow.[4].ConfigVoltage", NULL, "%.0f", HU_FLAG_STATIC, NULL },
+	{ "battery.voltage.nominal", 0, 0, "UPS.PowerSummary.ConfigVoltage", NULL, "%.1f", HU_FLAG_STATIC, NULL },
+	{ "output.frequency.nominal", 0, 0, "UPS.Flow.[4].ConfigFrequency", NULL, "%.0f", HU_FLAG_STATIC, NULL },
+
+	/* instant commands */
+	{ "load.off.delay", 0, 0, "UPS.PowerSummary.DelayBeforeShutdown", NULL, DEFAULT_OFFDELAY, HU_TYPE_CMD, NULL },
+	{ "load.on.delay", 0, 0, "UPS.PowerSummary.DelayBeforeStartup", NULL, DEFAULT_ONDELAY, HU_TYPE_CMD, NULL },
+	{ "shutdown.stop", 0, 0, "UPS.PowerSummary.DelayBeforeShutdown", NULL, "-1", HU_TYPE_CMD, NULL },
+
+	/* end of structure. */
+	{ NULL, 0, 0, NULL, NULL, NULL, 0, NULL }
+};
+
+static const char *idowell_format_model(HIDDevice_t *hd) {
+	return hd->Product;
+}
+
+static const char *idowell_format_mfr(HIDDevice_t *hd) {
+	return hd->Vendor ? hd->Vendor : "iDowell";
+}
+
+static const char *idowell_format_serial(HIDDevice_t *hd) {
+	return hd->Serial;
+}
+
+/* The Phoenixtec vendor ID (0x06da) is shared between several subdrivers:
+ * liebert-hid is the default sink, mge-hid grabs AEG PROTECT NAS, and we want
+ * only the GoldenMate LiFePO4 packs. They carry the same iDowell-style BMS
+ * firmware as the 0x075d:0x0300 device, reporting manufacturer "-BMS-" and
+ * product "Smart-Battery". Match on those strings so the other 0x06da devices
+ * fall through to liebert-hid / mge-hid. */
+static int idowell_is_goldenmate(HIDDevice_t *hd)
+{
+	if (hd->Vendor && strstr(hd->Vendor, "BMS")) {
+		return 1;
+	}
+	if (hd->Product && strstr(hd->Product, "Smart-Battery")) {
+		return 1;
+	}
+	return 0;
+}
+
+/* this function allows the subdriver to "claim" a device: return 1 if
+ * the device is supported by this subdriver, else 0. */
+static int idowell_claim(HIDDevice_t *hd)
+{
+	int status = is_usb_device_supported(idowell_usb_device_table, hd);
+
+	switch (status)
+	{
+	case POSSIBLY_SUPPORTED:
+		/* by default, reject, unless the productid option is given */
+		if (getval("productid")) {
+			return 1;
+		}
+		possibly_supported("iDowell", hd);
+		return 0;
+
+	case SUPPORTED:
+		/* On the shared Phoenixtec VID, only claim GoldenMate; let
+		 * liebert-hid (default sink) and mge-hid (AEG) handle the rest. */
+		if (hd->VendorID == PHOENIXTEC_VENDORID && !idowell_is_goldenmate(hd)) {
+			return 0;
+		}
+		return 1;
+
+	case NOT_SUPPORTED:
+	default:
+		return 0;
+	}
+}
+
+/* idowell_fix_report_desc: correct a firmware bug in GoldenMate LiFePO4 packs.
+ *
+ * These devices declare the same data points twice: once as Feature items in
+ * ReportID 0x01 (with sane Logical Maximum values) and again as Input items in
+ * ReportID 0x02. In ReportID 0x02 the firmware encodes the 4-byte Logical
+ * Maximum for UPS.PowerSummary.RunTimeToEmpty with the bytes in the wrong
+ * order: it emits "27 ff ff ff fe" (0xFEFFFFFF) where 0xFFFFFFFE was intended.
+ *
+ * 0xFEFFFFFF does not fit a signed 32-bit long, so on LLP64 platforms (Windows,
+ * where long is 32-bit) the generic "LogMax < LogMin" recovery in HIDParse()
+ * stores it back as the negative value -16777217. Per the HID spec, Logical
+ * values persist in global state, so the following UPS.PowerSummary.Voltage
+ * Input item inherits the same broken maximum. Both readings then come out as
+ * nonsense (battery.runtime = -16777217, battery.voltage = -167772.2) while the
+ * ReportID 0x01 Feature copies of the very same usages read correctly.
+ *
+ * Rather than invent limits, we copy the values this device itself declares for
+ * the same usages in ReportID 0x01: 0x75FFFFFF for RunTimeToEmpty (32-bit) and
+ * 65535 for Voltage (16-bit).
+ */
+#define IDOWELL_RUNTIME_LOGMAX	0x75FFFFFFL
+#define IDOWELL_VOLTAGE_LOGMAX	65535L
+
+/* idowell_fix_status_usage: correct a second firmware bug in the same packs.
+ *
+ * Feature report 0x01 declares seven 1-bit PresentStatus flags, but the
+ * firmware sets Usage Page 0x85 (Battery System) for ACPresent and never
+ * switches back to 0x84 (Power Device) for two of the flags:
+ *
+ *   05 85  09 d0 09 44 09 45 09 42  09 61  09 d1  09 69
+ *          ACPresent Charging       ^^^^^  Battery ^^^^^
+ *          Discharging BelowRCL     0x61   Present 0x69
+ *
+ * On the Battery System page 0x61 and 0x69 are AtRateTimeToEmpty and
+ * AverageTimeToEmpty, which are run-time counters and make no sense as
+ * single-bit status flags. On the Power Device page the same usages are
+ * Good and ShutdownImminent, which is clearly what was intended: on a
+ * healthy 06da:ffff unit they read 1 and 0 respectively both on mains
+ * and on battery, while ACPresent/Discharging flip as expected.
+ *
+ * Move just those two usages back to the Power Device page so the existing
+ * PresentStatus.Good and PresentStatus.ShutdownImminent mappings apply.
+ * The fix is narrowly scoped: report 0x01, Feature, 1-bit, directly under
+ * PresentStatus; anything else is left alone.
+ */
+static int idowell_fix_status_usage(HIDDesc_t *pDesc_arg,
+	HIDNode_t wrong_usage, HIDNode_t right_usage)
+{
+	HIDData_t	*pData;
+	HIDPath_t	*pPath;
+
+	if (!(pData = FindObject_with_ID_Node(pDesc_arg, 0x01, wrong_usage))) {
+		return 0;
+	}
+
+	pPath = &pData->Path;
+	if (pData->Type != ITEM_FEATURE || pData->Size != 1 || pPath->Size < 2
+	 || pPath->Node[pPath->Size - 2] != USAGE_POW_PRESENT_STATUS
+	) {
+		upsdebugx(4, "NOT fixing Report Descriptor: ReportID 0x01 "
+			"usage 0x%08x is not a 1-bit PresentStatus Feature flag",
+			(unsigned int)wrong_usage);
+		return 0;
+	}
+
+	pPath->Node[pPath->Size - 1] = right_usage;
+	upsdebugx(3, "Fixing Report Descriptor: set ReportID 0x01 "
+		"PresentStatus usage 0x%08x => 0x%08x",
+		(unsigned int)wrong_usage, (unsigned int)right_usage);
+
+	return 1;
+}
+
+static int idowell_fix_report_desc(HIDDevice_t *pDev, HIDDesc_t *pDesc_arg) {
+	HIDData_t	*pData;
+	int	retval = 0;
+
+	int	vendorID = pDev->VendorID;
+	int	productID = pDev->ProductID;
+
+	if (!((vendorID == PHOENIXTEC_VENDORID && productID == 0xffff)
+	   || (vendorID == IDOWELL_VENDORID && productID == 0x0300))) {
+		upsdebugx(3, "NOT Attempting Report Descriptor fix for UPS: "
+			"Vendor: %04x, Product: %04x (vendor/product not matched)",
+			(unsigned int)vendorID, (unsigned int)productID);
+		return 0;
+	}
+
+	if (disable_fix_report_desc) {
+		upsdebugx(3, "NOT Attempting Report Descriptor fix for UPS: "
+			"Vendor: %04x, Product: %04x "
+			"(got disable_fix_report_desc in config)",
+			(unsigned int)vendorID, (unsigned int)productID);
+		return 0;
+	}
+
+	upsdebugx(3, "Attempting Report Descriptor fix for UPS: "
+		"Vendor: %04x, Product: %04x",
+		(unsigned int)vendorID, (unsigned int)productID);
+
+	/* Only touch items whose maximum is demonstrably broken (below the
+	 * minimum), so a firmware revision that encodes this correctly is
+	 * left alone. */
+	if ((pData = FindObject_with_ID_Node(pDesc_arg, 0x02,
+			USAGE_BAT_RUN_TIME_TO_EMPTY))) {
+		upsdebugx(4, "Original Report Descriptor: ReportID 0x02 "
+			"RunTimeToEmpty LogMin: %ld LogMax: %ld",
+			pData->LogMin, pData->LogMax);
+
+		if (pData->LogMax < pData->LogMin) {
+			pData->LogMax = IDOWELL_RUNTIME_LOGMAX;
+			pData->assumed_LogMax = true;
+			upsdebugx(3, "Fixing Report Descriptor: set ReportID 0x02 "
+				"RunTimeToEmpty LogMax = %ld",
+				(long)IDOWELL_RUNTIME_LOGMAX);
+			retval++;
+		}
+	}
+
+	if ((pData = FindObject_with_ID_Node(pDesc_arg, 0x02,
+			USAGE_POW_VOLTAGE))) {
+		upsdebugx(4, "Original Report Descriptor: ReportID 0x02 "
+			"Voltage LogMin: %ld LogMax: %ld",
+			pData->LogMin, pData->LogMax);
+
+		if (pData->LogMax < pData->LogMin) {
+			pData->LogMax = IDOWELL_VOLTAGE_LOGMAX;
+			pData->assumed_LogMax = true;
+			upsdebugx(3, "Fixing Report Descriptor: set ReportID 0x02 "
+				"Voltage LogMax = %ld",
+				(long)IDOWELL_VOLTAGE_LOGMAX);
+			retval++;
+		}
+	}
+
+	retval += idowell_fix_status_usage(pDesc_arg,
+		USAGE_BAT_AT_RATE_TIME_TO_EMPTY, USAGE_POW_GOOD);
+	retval += idowell_fix_status_usage(pDesc_arg,
+		USAGE_BAT_AVERAGE_TIME_TO_EMPTY, USAGE_POW_SHUTDOWN_IMMINENT);
+
+	return retval;
+}
+
+subdriver_t idowell_subdriver = {
+	IDOWELL_HID_VERSION,
+	idowell_claim,
+	idowell_utab,
+	idowell_hid2nut,
+	idowell_format_model,
+	idowell_format_mfr,
+	idowell_format_serial,
+	idowell_fix_report_desc,
+	NULL,
+};

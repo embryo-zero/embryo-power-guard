@@ -1,0 +1,178 @@
+#
+# Network UPS Tools: AppVeyor CI build recipe: NUT for Windows with MSYS2/MinGW x64
+#
+# Copyright (C) 2022-2026	Jim Klimov <jimklimov+nut@gmail.com>
+#
+# Inspired by docs:
+# https://www.msys2.org/docs/ci/
+# https://www.appveyor.com/docs/appveyor-yml/
+# https://www.appveyor.com/docs/build-configuration/
+# https://www.appveyor.com/docs/windows-images-software/
+
+version: 2.8.5.{build}-{branch}
+
+# base image
+image: Visual Studio 2022
+
+# branches to build
+branches:
+  # whitelist
+  only:
+    - master
+    - FTY
+    - fightwarn
+    - /Windows/
+
+platform: x64
+
+# https://www.appveyor.com/docs/build-cache/
+environment:
+  # Note: APPVEYOR_SAVE_CACHE_ON_ERROR and APPVEYOR_CACHE_SKIP_SAVE are set
+  # in the init section below, depending on the branch and PR status.
+  # Store cache entries without (re-)compression: the data is mostly already
+  # compressed (ccache objects, pacman *.zst packages), and single-threaded
+  # LZMA at -mx=6 took 1-2 minutes per run for the ccache entry alone.
+  # The cache limit for PR builds is 1GB total across all entries, so
+  # ccache max_size is capped below (see install steps) to leave a margin
+  # for the other entries (pacman packages ~100MB, nut-win-deps, nut-ci):
+  APPVEYOR_CACHE_ENTRY_ZIP_ARGS: -t7z -mx=0
+  CCACHE_DIR: /home/appveyor/.ccache
+  CCACHE_MAXSIZE: 750MiB
+  DO_CLEAN_NUTCI_CACHE: no
+  DO_USE_NUTCI_CACHE: yes
+  MSYS: "winsymlinks:nativestrict"
+
+# Customize GH notification message template
+# TODO: for repetitive commits in a PR consider a clean-up GHA like
+#  https://github.com/marketplace/actions/delete-pr-comments-during-subsequent-ci
+notifications:
+  - provider: GitHubPullRequest
+    on_build_success: true
+    on_build_failure: true
+    on_build_status_changed: false
+    template: |
+      {{#passed}}:white_check_mark:{{/passed}}{{#failed}}:x:{{/failed}} [Build {{&projectName}} {{buildVersion}} {{status}}]({{buildUrl}}) (commit {{commitUrl}} by @{{&commitAuthorUsername}})
+      * [artifacts{{#failed}} (if any){{/failed}}]({{buildurl}}/artifacts)
+      {{#passed}}
+        {{#jobs}}
+          {{#messages}}
+      * {{message}}
+          {{/messages}}
+        {{/jobs}}
+      {{/passed}}
+
+# https://github.com/networkupstools/nut/blob/Windows-v2.8.0-1/docs/config-prereqs.txt#L951
+# or look for the chapter in nearby lines in later (current) revisions.
+# Note: not using `time` in scripts currently - they did upset
+# AppVeyor console log scanner with a /^sys.*/ match (apparently)
+# AppVeyor kills the job at 60 minutes, without saving the build cache:
+# a cold-ccache build then never gets warm, and an interrupted cache save
+# can even lose the old entry. So we set a deadline at 57 minutes after
+# the job start, and our build/test/bundle steps fail (via `timeout`) if
+# they would run past it. With APPVEYOR_SAVE_CACHE_ON_ERROR this leaves
+# a few minutes for the 7z step, artifact upload and saving the cache
+# (about 1.5 minutes in total as of 2026-10: 7z ~45s, cache save ~40s).
+# PR builds do not save the cache (see below), so they get no deadline
+# and can use the whole hour.
+# Each bash step below computes its time left like this (no CMD special
+# characters, so it passes through CMD intact):
+#   R=$(( ${CI_DEADLINE_EPOCH:-EPOCHSECONDS+3600} - EPOCHSECONDS ))
+init:
+  - ps: |
+        if (-not $env:APPVEYOR_PULL_REQUEST_NUMBER) { Set-AppveyorBuildVariable -Name CI_DEADLINE_EPOCH -Value ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 57 * 60) }
+  # There is one build cache per project, shared by all branches and PRs,
+  # and each save replaces the previous entries. So PR builds only restore
+  # the cache (warmed up by master builds), but do not save it: otherwise
+  # each PR build pushes objects of master (and other PRs) out of the
+  # limited cache space, and spends time to upload it all again. This is
+  # only a convenience, since a PR can change this file: to really keep
+  # PR builds from altering the cache used by master builds, untick "Save
+  # build cache in Pull Request builds" in the AppVeyor project settings.
+  # Builds of master also save the cache when they fail (e.g. by the
+  # deadline above), so that a cold cache gets warm over several builds;
+  # other branch builds only save it when they succeed. Note that for PR
+  # builds APPVEYOR_REPO_BRANCH is the target branch.
+  - ps: |
+        if ($env:APPVEYOR_PULL_REQUEST_NUMBER) { $env:APPVEYOR_CACHE_SKIP_SAVE = "true" } elseif ($env:APPVEYOR_REPO_BRANCH -eq "master") { $env:APPVEYOR_SAVE_CACHE_ON_ERROR = "true" }
+
+# The steps below are kept in scripts named after each section, under
+# .github/scripts/appveyor/ (.bat for `cmd`, .ps1 for `ps` steps),
+# numbered by the position of their section among the AppVeyor
+# pipeline script phases (01-init, 02-install, 03-before_build,
+# 04-build_script, 05-after_build, 06-before_test, 07-test_script,
+# 08-after_test, ...), see https://www.appveyor.com/docs/build-configuration/#build-pipeline
+# Note that `init` above runs before the repository is cloned, so it
+# has to stay inline.
+# NOTE for the .bat scripts: cmd.exe only treats double quotes as quoting,
+# not the single quotes around `bash -lc '...'` arguments, so any `|`, `||`,
+# `&`, `&&`, `<` or `>` outside of double quotes there is interpreted by
+# cmd itself (e.g. `a || b` runs `b` only as a cmd command if bash failed,
+# and silently drops everything after it otherwise). Use `if ! a ; then
+# b ; fi` style constructs (or double-quote such characters) instead.
+install:
+  - cmd: call "%APPVEYOR_BUILD_FOLDER%\.github\scripts\appveyor\02-install.bat"
+
+before_build:
+  - cmd: call "%APPVEYOR_BUILD_FOLDER%\.github\scripts\appveyor\03-before_build.bat"
+
+build_script:
+  - cmd: call "%APPVEYOR_BUILD_FOLDER%\.github\scripts\appveyor\04-build_script.bat"
+
+after_build:
+  - cmd: call "%APPVEYOR_BUILD_FOLDER%\.github\scripts\appveyor\05-after_build.bat"
+
+test_script:
+  - cmd: call "%APPVEYOR_BUILD_FOLDER%\.github\scripts\appveyor\07-test_script.bat"
+
+after_test:
+  - cmd: call "%APPVEYOR_BUILD_FOLDER%\.github\scripts\appveyor\08-after_test.bat"
+  - ps: '& "$env:APPVEYOR_BUILD_FOLDER\.github\scripts\appveyor\08-after_test.ps1"'
+
+# Note: AppVeyor saves the build cache after on_success scripts (and for
+# failed master builds right after the failing step, before on_failure), see
+# https://www.appveyor.com/docs/build-configuration/#build-pipeline
+on_success:
+  - ps: '& "$env:APPVEYOR_BUILD_FOLDER\.github\scripts\appveyor\12-on_success.ps1"'
+
+artifacts:
+  - path: 'NUT-for-Windows*.7z'
+    name: Bundle of binary files and FOSS dependencies of NUT for Windows
+
+  - path: config.log
+    name: config.log of recent build of NUT for Windows
+
+  - path: config.nut_report_feature.log
+    name: config.nut_report_feature.log of recent build of NUT for Windows
+
+# Example optional cache (depends on file change):
+# - C:\msys64 -> appveyor.yml
+cache:
+  - C:\projects\nut\config.cache
+  - C:\projects\.cache\nut-ci
+  - C:\msys64\home\appveyor\nut-win-deps
+  - C:\msys64\home\appveyor\.cache\nut-ci
+  - C:\msys64\home\appveyor\.ccache
+  - C:\msys64\home\appveyor\ccache # likely missing, no problem - but the name is reported in ccache status
+  - C:\Users\appveyor\AppData\Local\ccache # may be default in newer versions
+  - C:\Users\appveyor\AppData\Local\.ccache # may be missing, but for completeness like above
+  - C:\msys64\var\cache\pacman\pkg
+
+# Below we tried to stash binaries of MSYS2 environment
+# so VM deployment is faster on subsequent builds
+# (update/install "from scratch" costs about 3 min),
+# but unstashing the archive takes comparable time
+# and often leads to conflicts in pacman book-keeping,
+# while creating/updating the archive costs ~10 min.
+  #- C:\msys64\var\lib\pacman
+  #- C:\msys64\var\lib
+  #- C:\msys64\mingw64
+  #- C:\msys64\mingw32
+  #- C:\msys64\ucrt64
+  #- C:\msys64\clang32
+  #- C:\msys64\clang64
+  #- C:\msys64\clangarm64
+  #- C:\msys64\usr
+  #- C:\msys64\bin
+  #- C:\msys64\etc
+  #- C:\msys64\*.*
+  #- C:\msys64\installerResources

@@ -1,0 +1,59 @@
+UPSCLI_READLINE(3)
+==================
+
+NAME
+----
+
+upscli_readline, upscli_readline_timeout,
+upscli_readline_timeout_may_disconnect - Read a single response from a UPS
+
+SYNOPSIS
+--------
+
+------
+	#include <upsclient.h>
+	#include <time.h> /* or <sys/time.h> on some platforms */
+
+	ssize_t upscli_readline(UPSCONN_t *ups, char *buf, size_t buflen);
+
+	ssize_t upscli_readline_timeout(UPSCONN_t *ups, char *buf, size_t buflen,
+		const time_t timeout);
+
+	ssize_t upscli_readline_timeout_may_disconnect(UPSCONN_t *ups,
+		char *buf, size_t buflen, const time_t timeout,
+		int may_disconnect);
+------
+
+DESCRIPTION
+-----------
+
+The *upscli_readline()* and *upscli_readline_timeout()* functions take
+the  pointer 'ups' to a `UPSCONN_t` state structure, receive a single
+line from the server, and copy up to 'buflen' bytes of the response
+into the buffer 'buf'.
+
+These functions read raw lines and do not interpret ERR messages from
+linkman:upsd[8]. A successfully read ERR line returns '0'; the caller must
+check the protocol response. Higher-level functions such as
+linkman:upscli_get[3] perform this checking.
+
+The difference between the three functions is that *upscli_readline_timeout()*
+lets the caller decide the amount of time ('timeout' seconds) after which it
+should give up and return, whereas *upscli_readline()* does not offer this
+freedom, and uses NUT default network timeout (5 seconds). Both of these
+disconnect upon errors. The *upscli_readline_timeout_may_disconnect()*
+further allows to enable or disable such disconnections.
+
+RETURN VALUE
+------------
+
+The *upscli_readline()* and *upscli_readline_timeout()* functions
+return '0' on success, or '-1' if an error occurs.
+
+SEE ALSO
+--------
+
+linkman:upscli_fd[3], linkman:upscli_get[3],
+linkman:upscli_readline[3], linkman:upscli_sendline[3],
+linkman:upscli_ssl[3],
+linkman:upscli_strerror[3], linkman:upscli_upserror[3]

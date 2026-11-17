@@ -1,0 +1,63 @@
+UPSCLI_SSL_CAPS(3)
+==================
+
+NAME
+----
+
+upscli_ssl_caps, upscli_ssl_caps_descr - Report SSL capabilities of the
+current libupsclient build as a bitmap or string
+
+SYNOPSIS
+--------
+
+------
+	#include <upsclient.h>
+
+	/* Header above defines bitmap values:
+	 * UPSCLI_SSL_CAPS_NONE   	- No ability to use SSL
+	 * UPSCLI_SSL_CAPS_OPENSSL	- Can use OpenSSL-specific setup
+	 * UPSCLI_SSL_CAPS_NSS    	- Can use Mozilla NSS-specific setup
+	 * UPSCLI_SSL_CAPS_CERTIDENT_PASS - Can do CERTIDENT private key password
+	 * UPSCLI_SSL_CAPS_CERTIDENT_NAME - Can do CERTIDENT nickname check
+	 * UPSCLI_SSL_CAPS_CERTIDENT	 - both of the above: either backend,
+	 *                          	  except antique OpenSSL APIs
+	 * UPSCLI_SSL_CAPS_CERTHOST_ADDR_NUMBER	- Can do CERTHOST IP address check
+	 * UPSCLI_SSL_CAPS_CERTHOST_ADDR_TEXT	- Can do CERTHOST hostname check
+	 * UPSCLI_SSL_CAPS_CERTHOST_ADDR	- Can do CERTHOST IP address or hostname check
+	 * UPSCLI_SSL_CAPS_CERTHOST_NAME	- Can do CERTHOST nickname check
+	 * UPSCLI_SSL_CAPS_CERTHOST	 - both of the above: either backend,
+	 *                          	  except antique OpenSSL APIs
+	 */
+
+	int upscli_ssl_caps(void);
+	const char *upscli_ssl_caps_descr(void);
+------
+
+DESCRIPTION
+-----------
+
+The *upscli_ssl_caps*() function returns an `int` as a bitmap of SSL capability
+flags which may be of interest to the consumer of the linkman:upsclient[3]
+library (e.g. how to set up cryptographic material storage, and whether that
+should have any effect when initializing connections).
+
+The *upscli_ssl_caps_descr*() function returns a string with such information
+primarily intended for humans, e.g. to be used in NUT client program banners.
+
+If there is no built-in SSL support, alternative methods like SSH tunnels or
+the `stunnel` tool can be explored.
+
+RETURN VALUE
+------------
+
+The *upscli_ssl_caps*() function returns a bitmap of the capability flags
+listed above, or '0' if SSL support is missing. Test individual flags with
+bitwise AND, for example `caps & UPSCLI_SSL_CAPS_OPENSSL` or
+`caps & UPSCLI_SSL_CAPS_NSS`, rather than comparing the result to '1' or '2'.
+Certificate capability flags may also be set, depending on the backend
+and the APIs available when the library was built.
+
+SEE ALSO
+--------
+
+linkman:upscli_ssl[3], linkman:upscli_report_build_details[3]

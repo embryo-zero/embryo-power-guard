@@ -1,0 +1,780 @@
+/* conf.c - configuration handlers for upsd
+
+   Copyright (C)
+	2001		Russell Kroll <rkroll@exploits.org>
+	2019 - 2026	Jim Klimov <jimklimov+nut@gmail.com>
+
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation; either version 2 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program; if not, write to the Free Software
+   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+*/
+
+#include "upsd.h"
+#include "conf.h"
+#include "upsconf.h"
+#include "sstate.h"
+#include "user.h"
+#include "netssl.h"
+#include "nut_stdint.h"
+#include <ctype.h>
+#include <errno.h>
+
+static ups_t	*upstable = NULL;
+int	num_ups = 0;
+
+/* Users can pass a -D[...] option to enable debugging.
+ * For the service tracing purposes, also the upsd.conf
+ * can define a debug_min value in the global section,
+ * to set the minimal debug level (CLI provided value less
+ * than that would not have effect, can only have more).
+ */
+int	nut_debug_level_global = -1;
+/* Debug level specified via command line - we revert to
+ * it when reloading if there was no DEBUG_MIN in upsd.conf
+ */
+int nut_debug_level_args = 0;
+
+/* add another UPS for monitoring from ups.conf */
+static void ups_create(const char *fn, const char *name, const char *desc)
+{
+	upstype_t	*temp;
+
+	for (temp = firstups; temp != NULL; temp = temp->next) {
+		if (!strcasecmp(temp->name, name)) {
+			upslogx(LOG_ERR, "UPS name [%s] is already in use!", name);
+			return;
+		}
+	}
+
+	/* grab some memory and add the info */
+	temp = (upstype_t*)xcalloc(1, sizeof(*temp));
+	temp->fn = xstrdup(fn);
+	temp->name = xstrdup(name);
+
+	if (desc) {
+		temp->desc = xstrdup(desc);
+	}
+
+	temp->stale = 1;
+	temp->retain = 1;
+#ifdef WIN32
+	memset(&temp->read_overlapped,0,sizeof(temp->read_overlapped));
+	memset(temp->buf,0,sizeof(temp->buf));
+	temp->read_overlapped.hEvent = CreateEvent(NULL, /* Security */
+						FALSE, /* auto-reset*/
+						FALSE, /* initial state = non signaled */
+						NULL /* no name */);
+	if(temp->read_overlapped.hEvent == NULL ) {
+		upslogx(LOG_ERR, "Can't create event for UPS [%s]",
+			name);
+		return;
+	}
+#endif	/* WIN32 */
+	temp->sock_fd = sstate_connect(temp);
+
+	/* preload this to the current time to avoid false staleness */
+	time(&temp->last_heard);
+
+	temp->next = firstups;
+	firstups = temp;
+	num_ups++;
+}
+
+/* change the configuration of an existing UPS (used during reloads) */
+static void ups_update(const char *fn, const char *name, const char *desc)
+{
+	upstype_t	*temp;
+
+	temp = get_ups_ptr(name);
+
+	if (!temp) {
+		upslogx(LOG_ERR, "UPS %s disappeared during reload", name);
+		return;
+	}
+
+	/* paranoia */
+	if (!temp->fn) {
+		upslogx(LOG_ERR, "UPS %s had a NULL filename!", name);
+
+		/* let's give it something quick to use later */
+		temp->fn = xstrdup("");
+	}
+
+	/* when the filename changes, force a reconnect */
+	if (strcmp(temp->fn, fn) != 0) {
+
+		upslogx(LOG_NOTICE, "Redefined UPS [%s]", name);
+
+		/* release all data */
+		sstate_infofree(temp);
+		sstate_cmdfree(temp);
+		pconf_finish(&temp->sock_ctx);
+
+#ifndef WIN32
+		close(temp->sock_fd);
+#else	/* WIN32 */
+		CloseHandle(temp->sock_fd);
+#endif	/* WIN32 */
+		temp->sock_fd = ERROR_FD;
+		temp->dumpdone = 0;
+
+		/* now redefine the filename and wrap up */
+		free(temp->fn);
+		temp->fn = xstrdup(fn);
+	}
+
+	/* update the description */
+
+	free(temp->desc);
+
+	if (desc)
+		temp->desc = xstrdup(desc);
+	else
+		temp->desc = NULL;
+
+	/* always set this on reload */
+	temp->retain = 1;
+}
+
+/* returns 1 if "arg" was usable as a boolean value, 0 if not
+ * saves converted meaning of "arg" into referenced "result"
+ */
+static int parse_boolean(char *arg, int *result)
+{
+	if ( (!strcasecmp(arg, "true")) || (!strcasecmp(arg, "on")) || (!strcasecmp(arg, "yes")) || (!strcasecmp(arg, "1"))) {
+		*result = 1;
+		return 1;
+	}
+	if ( (!strcasecmp(arg, "false")) || (!strcasecmp(arg, "off")) || (!strcasecmp(arg, "no")) || (!strcasecmp(arg, "0"))) {
+		*result = 0;
+		return 1;
+	}
+	return 0;
+}
+
+/* Return 1 if usable, 0 if not, -1 for an invalid LISTEN address. */
+static int parse_upsd_conf_args(size_t numargs, char **arg)
+{
+	int n, starts_with_digit;
+	long l;
+
+	/* everything below here uses up through arg[1] */
+	if (numargs < 2)
+		return 0;
+
+	/* Preserve rejection of signs and leading whitespace for numeric options.
+	 * str_to_int/long also check the rest of the value and its range, while
+	 * allowing trailing whitespace as atoi/atol did. Use temporary values
+	 * because the conversion helpers clear their output on failure. */
+	starts_with_digit = (arg[1][0] >= '0' && arg[1][0] <= '9');
+
+	/* DEBUG_MIN (NUM) */
+	/* debug_min (NUM) also acceptable, to be on par with ups.conf */
+	if (!strcasecmp(arg[0], "DEBUG_MIN")) {
+		int lvl = -1; /* typeof common/common.c: int nut_debug_level */
+		if ( str_to_int (arg[1], &lvl, 10) && lvl >= 0 ) {
+			nut_debug_level_global = lvl;
+		} else {
+			upslogx(LOG_INFO, "DEBUG_MIN has non numeric or negative value in upsd.conf");
+		}
+		return 1;
+	}
+
+	/* MAXAGE <seconds> */
+	if (!strcmp(arg[0], "MAXAGE")) {
+		if (starts_with_digit && str_to_int(arg[1], &n, 10)) {
+			maxage = n;
+			return 1;
+		}
+		else {
+			upslogx(LOG_ERR, "MAXAGE has invalid or out of range numeric value (%s)!", arg[1]);
+			return 0;
+		}
+	}
+
+	/* TRACKINGDELAY <seconds> */
+	if (!strcmp(arg[0], "TRACKINGDELAY")) {
+		if (starts_with_digit && str_to_int(arg[1], &n, 10)) {
+			tracking_delay = n;
+			return 1;
+		}
+		else {
+			upslogx(LOG_ERR, "TRACKINGDELAY has invalid or out of range numeric value (%s)!", arg[1]);
+			return 0;
+		}
+	}
+
+	/* ALLOW_NO_DEVICE <bool> */
+	if (!strcmp(arg[0], "ALLOW_NO_DEVICE")) {
+		if (isdigit((size_t)arg[1][0])) {
+			allow_no_device = (atoi(arg[1]) != 0); /* non-zero arg is true here */
+			return 1;
+		}
+		if (parse_boolean(arg[1], &allow_no_device))
+			return 1;
+
+		upslogx(LOG_ERR, "ALLOW_NO_DEVICE has non numeric and non boolean value (%s)!", arg[1]);
+		return 0;
+	}
+
+	/* ALLOW_NOT_ALL_LISTENERS <bool> */
+	if (!strcmp(arg[0], "ALLOW_NOT_ALL_LISTENERS")) {
+		if (isdigit((size_t)arg[1][0])) {
+			allow_not_all_listeners = (atoi(arg[1]) != 0); /* non-zero arg is true here */
+			return 1;
+		}
+		if (parse_boolean(arg[1], &allow_not_all_listeners))
+			return 1;
+
+		upslogx(LOG_ERR, "ALLOW_NOT_ALL_LISTENERS has non numeric and non boolean value (%s)!", arg[1]);
+		return 0;
+	}
+
+	/* MAXCONN <connections> */
+	if (!strcmp(arg[0], "MAXCONN")) {
+		if (starts_with_digit && str_to_long(arg[1], &l, 10)
+		&& (uintmax_t)(nfds_t)l == (uintmax_t)l
+		) {
+			maxconn = (nfds_t)l;
+			return 1;
+		}
+		else {
+			upslogx(LOG_ERR, "MAXCONN has invalid or out of range numeric value (%s)!", arg[1]);
+			return 0;
+		}
+	}
+
+	/* STATEPATH <dir> */
+	if (!strcmp(arg[0], "STATEPATH")) {
+		const char *sp = getenv("NUT_STATEPATH");
+		if (sp && strcmp(sp, arg[1])) {
+			/* Only warn if the two strings are not equal */
+			upslogx(LOG_WARNING,
+				"Ignoring STATEPATH='%s' from upsd.conf configuration file, "
+				"in favor of NUT_STATEPATH='%s' environment variable",
+				NUT_STRARG(arg[1]), NUT_STRARG(sp));
+		}
+		free(statepath);
+		statepath = xstrdup(sp ? sp : arg[1]);
+		return 1;
+	}
+
+	/* DATAPATH <dir> */
+	if (!strcmp(arg[0], "DATAPATH")) {
+		free(datapath);
+		datapath = xstrdup(arg[1]);
+		return 1;
+	}
+
+#if defined(WITH_SSL)
+# ifdef WITH_OPENSSL
+	/* CERTFILE <dir>
+	 * Specific PEM file with server/CA[...]/private-key
+	 * chain used to identify this server
+	 */
+	if (!strcmp(arg[0], "CERTFILE")) {
+		free(certfile);
+		certfile = xstrdup(arg[1]);
+		return 1;
+	}
+
+# elif (defined WITH_NSS) /* WITH_OPENSSL */
+
+	if (!strcmp(arg[0], "CERTFILE")) {
+		upsdebugx(1, "%s is not supported in this SSL build: --without-openssl", arg[0]);
+		return 0;
+	}
+
+# endif	/* WITH_OPENSSL || WITH_NSS */
+
+	/* Options with one argument that are common for both SSL backends follow.
+	 * See below for [NSS] handling of `CERTIDENT <name> <passwd>` with 2 arguments.
+	 */
+
+	/* CERTPATH <dir>
+	 * NSS: database files live here, storing both server, CA and client info
+	 *   as needed.
+	 * OpenSSL: CERTPATH may be needed to know the CA(s) for client validation
+	 *   (if a different one issued those certs than the one used by server?)
+	 *   Directory with CA PEM files, hash-encoded (originally or as symlinks).
+	 */
+	if (!strcmp(arg[0], "CERTPATH")) {
+		free(certpath);
+		certpath = xstrdup(arg[1]);
+		return 1;
+	}
+
+# ifdef WITH_CLIENT_CERTIFICATE_VALIDATION
+	/* CERTREQUEST (0 | 1 | 2) */
+	if (!strcmp(arg[0], "CERTREQUEST")) {
+		if (starts_with_digit && str_to_int(arg[1], &n, 10)
+		&&  n >= NETSSL_CERTREQ_MIN && n <= NETSSL_CERTREQ_MAX
+		) {
+			certrequest = n;
+			return 1;
+		}
+		else {
+			if (!strcmp(arg[1], "NO")) {
+				certrequest = NETSSL_CERTREQ_NO;	/* 0 */
+				return 1;
+			}
+			if (!strcmp(arg[1], "REQUEST")) {
+				certrequest = NETSSL_CERTREQ_REQUEST;	/* 1 */
+				return 1;
+			}
+			if (!strcmp(arg[1], "REQUIRE")) {
+				certrequest = NETSSL_CERTREQ_REQUIRE;	/* 2 */
+				return 1;
+			}
+			upslogx(LOG_ERR, "CERTREQUEST has invalid or out of range value (%s)!", arg[1]);
+			return 0;
+		}
+	}
+# else	/* !WITH_CLIENT_CERTIFICATE_VALIDATION */
+	if (!strcmp(arg[0], "CERTREQUEST")) {
+		upslogx(LOG_ERR, "CERTREQUEST is not supported in this SSL build: --without-ssl-client-validation");
+		return 0;
+	}
+# endif	/* WITH_CLIENT_CERTIFICATE_VALIDATION */
+
+	/* DISABLE_WEAK_SSL <bool> */
+	if (!strcmp(arg[0], "DISABLE_WEAK_SSL")) {
+		if (parse_boolean(arg[1], &disable_weak_ssl))
+			return 1;
+
+		upslogx(LOG_ERR, "DISABLE_WEAK_SSL has non boolean value (%s)!", arg[1]);
+		return 0;
+	}
+
+#else	/* !WITH_SSL */
+
+	if (!strcmp(arg[0], "CERTREQUEST") || !strcmp(arg[0], "CERTPATH")
+	 || !strcmp(arg[0], "CERTIDENT") || !strcmp(arg[0], "CERTFILE")
+	 || !strcmp(arg[0], "DISABLE_WEAK_SSL")
+	) {
+		upsdebugx(1, "%s is not supported in this non-SSL build", arg[0]);
+		return 0;
+	}
+
+#endif	/* WITH_SSL */
+
+	/* ACCEPT <aclname> [<aclname>...] */
+	if (!strcmp(arg[0], "ACCEPT")) {
+		upslogx(LOG_WARNING, "ACCEPT in upsd.conf is no longer supported - switch to LISTEN");
+		return 1;
+	}
+
+	/* REJECT <aclname> [<aclname>...] */
+	if (!strcmp(arg[0], "REJECT")) {
+		upslogx(LOG_WARNING, "REJECT in upsd.conf is no longer supported - switch to LISTEN");
+		return 1;
+	}
+
+	/* LISTEN <address> [<port>] */
+	if (!strcmp(arg[0], "LISTEN")) {
+		char *address, *port;
+		if (!str_split_listen(arg[1], &address, &port) || (port && numargs >= 3)) {
+			upslogx(LOG_ERR, "Invalid LISTEN address or duplicate port: %s", arg[1]);
+			return -1;
+		}
+		/* Preserve the existing separate port syntax and its validation. */
+		listen_add(address, numargs >= 3 ? arg[2] : (port ? port : string_const(NUT_PORT)));
+		return 1;
+	}
+
+	/* everything below here uses up through arg[2] */
+	if (numargs < 3)
+		return 0;
+
+	/* ACL <aclname> <ip block> */
+	if (!strcmp(arg[0], "ACL")) {
+		upslogx(LOG_WARNING, "ACL in upsd.conf is no longer supported - switch to LISTEN");
+		return 1;
+	}
+
+#if defined(WITH_NSS) || defined(WITH_OPENSSL)
+	/* CERTIDENT <name> <passwd> */
+	/* Note: warning logs about rejection of the keyword for non-SSL builds is handled above */
+	if (!strcmp(arg[0], "CERTIDENT")) {
+		free(certname);
+		certname = xstrdup(arg[1]);
+		free(certpasswd);
+		certpasswd = xstrdup(arg[2]);
+		return 1;
+	}
+#endif /* WITH_NSS || WITH_OPENSSL */
+
+	/* not recognized */
+	return 0;
+}
+
+/* called for fatal errors in parseconf like malloc failures */
+static void upsd_conf_err(const char *errmsg)
+{
+	upslogx(LOG_ERR, "Fatal error in parseconf (upsd.conf): %s", errmsg);
+}
+
+void load_upsdconf(int reloading)
+{
+	char	fn[NUT_PATH_MAX];
+	PCONF_CTX_t	ctx;
+	int	numerrors = 0, listen_errors = 0;
+
+	snprintf(fn, sizeof(fn), "%s/upsd.conf", confpath());
+
+	check_perms(fn);
+
+	pconf_init(&ctx, upsd_conf_err);
+
+retry:
+	if (!pconf_file_begin(&ctx, fn)) {
+		if (errno == EMFILE && reloading == 2) {
+			close_oldest_client();
+			goto retry;
+		}
+		pconf_finish(&ctx);
+
+		if (!reloading)
+			fatalx(EXIT_FAILURE, "%s", ctx.errmsg);
+
+		upslogx(LOG_ERR, "Reload failed: %s", ctx.errmsg);
+		return;
+	}
+
+	if (reloading) {
+		/* if upsd.conf added or changed
+		 * (or commented away) the debug_min
+		 * setting, detect that */
+		nut_debug_level_global = -1;
+	}
+
+	while (pconf_file_next(&ctx)) {
+		int parsed;
+		if (pconf_parse_error(&ctx)) {
+			upslogx(LOG_ERR, "Parse error: %s:%d: %s",
+				fn, ctx.linenum, ctx.errmsg);
+			numerrors++;
+			continue;
+		}
+
+		if (ctx.numargs < 1)
+			continue;
+
+		parsed = parse_upsd_conf_args(ctx.numargs, ctx.arglist);
+		if (parsed < 0) {
+			listen_errors++;
+		}
+		if (parsed <= 0) {
+			unsigned int	i;
+			char	errmsg[SMALLBUF];
+
+			snprintf(errmsg, sizeof(errmsg),
+				"upsd.conf: invalid directive");
+
+			for (i = 0; i < ctx.numargs; i++)
+				snprintfcat(errmsg, sizeof(errmsg), " %s",
+					ctx.arglist[i]);
+
+			numerrors++;
+			upslogx(LOG_WARNING, "%s", errmsg);
+		}
+
+	}
+
+	if (reloading) {
+		if (nut_debug_level_global > -1) {
+			upslogx(LOG_INFO,
+				"Applying DEBUG_MIN %d from upsd.conf",
+				nut_debug_level_global);
+			nut_debug_level = nut_debug_level_global;
+		} else {
+			/* DEBUG_MIN is absent or commented-away in ups.conf */
+			upslogx(LOG_INFO,
+				"Applying debug level %d from "
+				"original command line arguments",
+				nut_debug_level_args);
+			nut_debug_level = nut_debug_level_args;
+		}
+	}
+
+	/* FIXME: Per legacy behavior, we silently went on.
+	 * Maybe should abort on unusable configs?
+	 */
+	if (numerrors) {
+		upslogx(LOG_ERR, "Encountered %d config errors, those entries were ignored", numerrors);
+	}
+
+	pconf_finish(&ctx);
+	if (listen_errors && !reloading) {
+		/* Do not fall back to defaults or rely on getaddrinfo() rejecting
+		 * malformed input: Windows may accept it and use the default port.
+		 * Reload never changes listeners, including malformed new entries. */
+		fatalx(EXIT_FAILURE, "Invalid LISTEN configuration");
+	}
+}
+
+static int load_upsconf(int reloading) {
+	int	ret;
+
+	ret = read_upsconf(0);	/* 0 = do not abort fatally just yet */
+	if (ret == -1) {
+		if (errno == EMFILE && reloading == 2) {
+			upsdebugx(1, "%s: close an oldest client connection and try reading config again", __func__);
+			close_oldest_client();
+			ret = read_upsconf(1);	/* 1 = may abort upon fundamental errors */
+		} else {
+			/* Not fatalx(), the method above already reported the problem */
+			exit(EXIT_FAILURE);
+		}
+	}
+
+	return ret;
+}
+
+/* callback during parsing of ups.conf */
+void do_upsconf_args(char *upsname, char *var, char *val)
+{
+	ups_t	*temp;
+
+	/* almost no "global" stuff for us */
+	if (!upsname) {
+
+		/* STATEPATH <dir> (may be lower-case) */
+		if (!strcasecmp(var, "STATEPATH")) {
+			const char *sp = getenv("NUT_STATEPATH");
+			if (sp && strcmp(sp, val)) {
+				/* Only warn if the two strings are not equal */
+				upslogx(LOG_WARNING,
+					"Ignoring STATEPATH='%s' from ups.conf configuration file, "
+					"in favor of NUT_STATEPATH='%s' environment variable",
+					NUT_STRARG(val), NUT_STRARG(sp));
+			}
+			free(statepath);
+			statepath = xstrdup(sp ? sp : val);
+			/* This setting source keeps priority
+			 * to best match up with the drivers */
+			setenv("NUT_STATEPATH", statepath, 1);
+		}
+
+		return;
+	}
+
+	/* check if UPS is already listed */
+	for (temp = upstable; temp != NULL; temp = temp->next) {
+		if (!strcmp(temp->upsname, upsname)) {
+			break;
+		}
+	}
+
+	/* if not listed, create a new entry and prepend it to the list */
+	if (temp == NULL) {
+		temp = (ups_t*)xcalloc(1, sizeof(*temp));
+		temp->upsname = xstrdup(upsname);
+		temp->next = upstable;
+		upstable = temp;
+	}
+
+	if (!strcmp(var, "driver")) {
+		free(temp->driver);
+		temp->driver = xstrdup(val);
+	} else if (!strcmp(var, "port")) {
+		free(temp->port);
+		temp->port = xstrdup(val);
+	} else if (!strcmp(var, "desc")) {
+		free(temp->desc);
+		temp->desc = xstrdup(val);
+	}
+}
+
+/* add valid UPSes from ups.conf to the internal structures */
+void upsconf_add(int reloading)
+{
+	ups_t	*tmp = upstable, *next;
+	char	statefn[NUT_PATH_MAX];
+
+	if (!tmp) {
+		upslogx(LOG_WARNING, "Warning: no UPS definitions in ups.conf");
+		return;
+	}
+
+	while (tmp) {
+
+		/* save for later, since we delete as we go along */
+		next = tmp->next;
+
+		/* this should always be set, but better safe than sorry */
+		if (!tmp->upsname) {
+			tmp = tmp->next;
+			continue;
+		}
+
+		/* don't accept an entry that's missing items */
+		if ((!tmp->driver) || (!tmp->port)) {
+			upslogx(LOG_WARNING, "Warning: ignoring incomplete configuration for UPS [%s]\n",
+				tmp->upsname);
+		} else {
+			snprintf(statefn, sizeof(statefn), "%s-%s",
+				tmp->driver, tmp->upsname);
+
+			/* if a UPS exists, update it, else add it as new */
+			if ((reloading) && (get_ups_ptr(tmp->upsname) != NULL))
+				ups_update(statefn, tmp->upsname, tmp->desc);
+			else
+				ups_create(statefn, tmp->upsname, tmp->desc);
+		}
+
+		/* free tmp's resources */
+
+		free(tmp->driver);
+		free(tmp->port);
+		free(tmp->desc);
+		free(tmp->upsname);
+		free(tmp);
+
+		tmp = next;
+	}
+
+	/* upstable should be completely gone by this point */
+	upstable = NULL;
+}
+
+/* remove a UPS from the linked list */
+static void delete_ups(upstype_t *target)
+{
+	upstype_t	*ptr, *last;
+
+	if (!target)
+		return;
+
+	ptr = last = firstups;
+
+	while (ptr) {
+		if (ptr == target) {
+			upslogx(LOG_NOTICE, "Deleting UPS [%s]", target->name);
+
+			/* make sure nobody stays logged into this thing */
+			kick_login_clients(target->name);
+
+			/* about to delete the first ups? */
+			if (ptr == last)
+				firstups = ptr->next;
+			else
+				last->next = ptr->next;
+
+			if (VALID_FD(ptr->sock_fd))
+#ifndef WIN32
+				close(ptr->sock_fd);
+#else	/* WIN32 */
+				CloseHandle(ptr->sock_fd);
+#endif	/* WIN32 */
+
+			/* release memory */
+			sstate_infofree(ptr);
+			sstate_cmdfree(ptr);
+			pconf_finish(&ptr->sock_ctx);
+
+			free(ptr->fn);
+			free(ptr->name);
+			free(ptr->desc);
+			free(ptr);
+
+			return;
+		}
+
+		last = ptr;
+		ptr = ptr->next;
+	}
+
+	/* shouldn't happen */
+	upslogx(LOG_ERR, "delete_ups: UPS not found");
+}
+
+/* see if we can open a file */
+static int check_file(const char *fn)
+{
+	char	chkfn[NUT_PATH_MAX];
+	FILE	*f;
+	int	retries = 0;
+
+	snprintf(chkfn, sizeof(chkfn), "%s/%s", confpath(), fn);
+
+retry:
+	f = fopen(chkfn, "r");
+
+	if (!f) {
+		if (errno == EMFILE && retries < 10) {
+			close_oldest_client();
+			retries++;
+			goto retry;
+		}
+		upslog_with_errno(LOG_ERR, "Reload failed: can't open %s", chkfn);
+		return 0;	/* failed */
+	}
+
+	fclose(f);
+	return 1;	/* OK */
+}
+
+/* called after SIGHUP */
+void conf_reload(void)
+{
+	upstype_t	*upstmp, *upsnext;
+
+	upslogx(LOG_INFO, "SIGHUP: reloading configuration");
+
+	/* see if we can access upsd.conf before blowing away the config */
+	if (!check_file("upsd.conf"))
+		return;
+
+	/* reset retain flags on all known UPS entries */
+	upstmp = firstups;
+	while (upstmp) {
+		upstmp->retain = 0;
+		upstmp = upstmp->next;
+	}
+
+	/* reload from ups.conf */
+	load_upsconf(2);		/* 2 = reloading, and may retry by closing clients if EMFILE */
+	upsconf_add(1);			/* 1 = reloading */
+
+	/* now reread upsd.conf */
+	load_upsdconf(2);		/* 2 = reloading, and may retry by closing clients if EMFILE */
+
+	/* now delete all UPS entries that didn't get reloaded */
+
+	upstmp = firstups;
+
+	while (upstmp) {
+		/* upstmp may be deleted during this pass */
+		upsnext = upstmp->next;
+
+		if (upstmp->retain == 0)
+			delete_ups(upstmp);
+
+		upstmp = upsnext;
+	}
+
+	/* did they actually delete the last UPS? */
+	if (firstups == NULL)
+		upslogx(LOG_WARNING, "Warning: no UPSes currently defined!");
+
+	/* and also make sure upsd.users can be read... */
+	if (!check_file("upsd.users"))
+		return;
+
+	/* delete all users */
+	user_flush();
+
+	/* and finally reread from upsd.users */
+	user_load();
+}
